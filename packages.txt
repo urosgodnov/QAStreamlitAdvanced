@@ -1,5 +1,2 @@
 poppler-utils 
 tesseract-ocr
-build-essential
-cmake
-pkg-config
