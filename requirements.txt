@@ -1,0 +1,12 @@
+streamlit
+docling
+chromadb
+sentence-transformers
+langchain
+spacy
+pandas
+protobuf==3.20.3
+pysqlite3-binary
+transformers
+torch
+sentencepiece
