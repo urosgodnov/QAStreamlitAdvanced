@@ -19,7 +19,6 @@ from langchain.text_splitter import (
     CharacterTextSplitter,
     SpacyTextSplitter
 )
-from transformers import T5ForConditionalGeneration, T5Tokenizer
 import torch
 
 # Page config
@@ -28,27 +27,44 @@ st.set_page_config(
     layout="wide"
 )
 
-st.title("📄 Document Q&A with FLAN-T5")
+st.title("📄 Document Q&A with FLAN-T5/GPT-2")
 st.caption("Created by Uros Godnov")
 
 @st.cache_resource
 def load_flan_t5_model():
     """Load FLAN-T5-small model from Hugging Face"""
     try:
-        model_name = "google/flan-t5-small"
-        tokenizer = T5Tokenizer.from_pretrained(model_name)
-        model = T5ForConditionalGeneration.from_pretrained(model_name)
-        return model, tokenizer
+        # Try FLAN-T5 first, fallback to GPT-2 if sentencepiece fails
+        try:
+            from transformers import T5ForConditionalGeneration, T5Tokenizer
+            model_name = "google/flan-t5-small"
+            tokenizer = T5Tokenizer.from_pretrained(model_name)
+            model = T5ForConditionalGeneration.from_pretrained(model_name)
+            return model, tokenizer, "flan-t5"
+        except Exception as sentencepiece_error:
+            st.warning(f"FLAN-T5 failed (sentencepiece issue): {sentencepiece_error}")
+            st.info("Falling back to GPT-2 for text generation...")
+            
+            # Fallback to GPT-2 which doesn't need sentencepiece
+            from transformers import GPT2LMHeadModel, GPT2Tokenizer
+            model_name = "gpt2"
+            tokenizer = GPT2Tokenizer.from_pretrained(model_name)
+            model = GPT2LMHeadModel.from_pretrained(model_name)
+            
+            # GPT-2 needs a pad token
+            tokenizer.pad_token = tokenizer.eos_token
+            
+            return model, tokenizer, "gpt2"
+            
     except Exception as e:
-        st.error(f"Error loading FLAN-T5 model: {e}")
-        st.error("Make sure 'sentencepiece' is in your requirements.txt")
-        return None, None
+        st.error(f"Error loading any model: {e}")
+        return None, None, None
 
-def generate_flan_t5_answer(question, context_chunks, model, tokenizer, max_length=256):
-    """Generate answer using FLAN-T5 model - SIMPLE approach"""
+def generate_flan_t5_answer(question, context_chunks, model, tokenizer, model_type, max_length=256):
+    """Generate answer using FLAN-T5 or GPT-2 model"""
     
     if model is None or tokenizer is None:
-        return "FLAN-T5 model not available."
+        return "Model not available."
     
     try:
         # Combine chunks into context
@@ -62,14 +78,22 @@ def generate_flan_t5_answer(question, context_chunks, model, tokenizer, max_leng
         if len(overlap) < 2 and len(question_keywords) > 3:
             return "Information not found in the document."
         
-        # SIMPLE PROMPT - just concatenate everything directly
-        prompt = f"{question}\n\nContext: {context}\n\nAnswer:"
+        # Different prompts for different models
+        if model_type == "flan-t5":
+            # FLAN-T5 prompt (instruction-following)
+            prompt = f"{question}\n\nContext: {context}\n\nAnswer:"
+        else:
+            # GPT-2 prompt (completion-style)
+            prompt = f"Question: {question}\n\nBased on this context: {context}\n\nAnswer: "
         
         # Truncate if needed
         if len(prompt) > 400:
             available_space = 400 - len(f"{question}\n\nContext: \n\nAnswer:")
             truncated_context = context[:available_space] + "..."
-            prompt = f"{question}\n\nContext: {truncated_context}\n\nAnswer:"
+            if model_type == "flan-t5":
+                prompt = f"{question}\n\nContext: {truncated_context}\n\nAnswer:"
+            else:
+                prompt = f"Question: {question}\n\nBased on this context: {truncated_context}\n\nAnswer: "
         
         # Tokenize
         inputs = tokenizer(
@@ -80,25 +104,51 @@ def generate_flan_t5_answer(question, context_chunks, model, tokenizer, max_leng
             padding=True
         )
         
-        # Simple generation - let FLAN-T5 handle the instruction
+        # Different generation parameters for different models
+        if model_type == "flan-t5":
+            generation_params = {
+                "max_length": max_length,
+                "min_length": 15,
+                "num_beams": 4,
+                "early_stopping": True,
+                "temperature": 0.7,
+                "do_sample": False,
+                "pad_token_id": tokenizer.eos_token_id
+            }
+        else:  # GPT-2
+            generation_params = {
+                "max_length": inputs['input_ids'].shape[1] + 100,  # Add tokens to input length
+                "min_length": inputs['input_ids'].shape[1] + 20,
+                "temperature": 0.7,
+                "do_sample": True,
+                "top_p": 0.9,
+                "pad_token_id": tokenizer.eos_token_id,
+                "eos_token_id": tokenizer.eos_token_id,
+                "no_repeat_ngram_size": 3,
+            }
+        
+        # Generate
         with torch.no_grad():
-            outputs = model.generate(
-                **inputs,
-                max_length=max_length,
-                min_length=15,
-                num_beams=4,
-                early_stopping=True,
-                temperature=0.7,
-                do_sample=False,
-                pad_token_id=tokenizer.eos_token_id
-            )
+            outputs = model.generate(**inputs, **generation_params)
         
         # Decode
-        response = tokenizer.decode(outputs[0], skip_special_tokens=True)
-        
-        # Clean up - just remove the prompt parts
-        if "Answer:" in response:
-            response = response.split("Answer:")[-1].strip()
+        if model_type == "flan-t5":
+            response = tokenizer.decode(outputs[0], skip_special_tokens=True)
+            # Clean up - just remove the prompt parts
+            if "Answer:" in response:
+                response = response.split("Answer:")[-1].strip()
+        else:  # GPT-2
+            # For GPT-2, we need to extract only the new tokens (the answer)
+            input_length = inputs['input_ids'].shape[1]
+            generated_tokens = outputs[0][input_length:]
+            response = tokenizer.decode(generated_tokens, skip_special_tokens=True)
+            
+            # Clean up GPT-2 response
+            # Stop at first newline or period followed by newline (end of answer)
+            for stop_seq in ['\n\n', '\nQuestion:', '\nQ:', '\n\n']:
+                if stop_seq in response:
+                    response = response.split(stop_seq)[0]
+                    break
         
         # Basic validation
         if not response.strip() or len(response.strip()) < 5:
@@ -120,8 +170,8 @@ def get_embedding_function():
 st.sidebar.header("Configuration")
 
 # Model options
-st.sidebar.subheader("FLAN-T5 Model")
-st.sidebar.info("Using google/flan-t5-small from Hugging Face")
+st.sidebar.subheader("Language Model")
+st.sidebar.info("Tries FLAN-T5 first, falls back to GPT-2 if sentencepiece fails")
 
 max_output_length = st.sidebar.slider(
     "Max Answer Length",
@@ -148,7 +198,7 @@ num_chunks = st.sidebar.slider(
     min_value=3,
     max_value=8,
     value=4,
-    help="FLAN-T5 works best with fewer, high-quality chunks"
+    help="Number of relevant chunks to use for answer generation"
 )
 
 # File uploader
@@ -242,15 +292,19 @@ if uploaded_file:
                 
                 collection.add(documents=chunks, ids=ids, metadatas=metadatas)
             
-            # Load FLAN-T5 model
-            with st.spinner('Loading FLAN-T5 model...'):
-                model, tokenizer = load_flan_t5_model()
+            # Load language model
+            with st.spinner('Loading language model...'):
+                model, tokenizer, model_type = load_flan_t5_model()
             
             if model is None:
-                st.error("Failed to load FLAN-T5 model. Please add 'sentencepiece' to requirements.txt")
+                st.error("Failed to load any language model.")
                 st.stop()
             
-            st.success(f'✅ Ready! ChromaDB collection with {len(chunks)} chunks and FLAN-T5 loaded!')
+            if model_type == "flan-t5":
+                st.success(f'✅ Ready! ChromaDB collection with {len(chunks)} chunks and FLAN-T5 loaded!')
+            else:
+                st.success(f'✅ Ready! ChromaDB collection with {len(chunks)} chunks and GPT-2 loaded!')
+                st.info("⚠️ Using GPT-2 fallback - instruction following may be limited.")
             
             # Show preview of chunks
             st.subheader("Chunk Preview")
@@ -266,8 +320,8 @@ if uploaded_file:
             # Question input
             query = st.text_input(
                 "Your Question:",
-                placeholder="e.g., What is text embedding? Explain in 10 words.",
-                help="Ask any question. Be specific with instructions: 'explain in 10 words', 'list 3 points', 'answer briefly', etc."
+                placeholder="e.g., What is text embedding? Explain in 2 sentences.",
+                help="Ask any question. Be specific with instructions: 'explain in 2 sentences', 'list 3 points', 'answer briefly', etc."
             )
             
             if query:
@@ -284,12 +338,13 @@ if uploaded_file:
                     
                     st.subheader("🤖 Answer")
                     
-                    with st.spinner('Generating answer with FLAN-T5...'):
+                    with st.spinner('Generating answer...'):
                         answer = generate_flan_t5_answer(
                             query, 
                             retrieved_chunks, 
                             model, 
                             tokenizer, 
+                            model_type,
                             max_output_length
                         )
                     
@@ -361,43 +416,47 @@ else:
     - 📄 Document conversion with Docling (PDF, DOCX)
     - ✂️ Multiple chunking strategies with LangChain
     - 🔍 ChromaDB vector database for semantic search
-    - 🤖 **FLAN-T5** with enhanced instruction-following
-    - 🎯 **Precise instruction compliance** - "explain in 10 words", "list 3 points", etc.
+    - 🤖 **FLAN-T5** with automatic **GPT-2 fallback** (no sentencepiece issues!)
+    - 🎯 **Works without sentencepiece** - automatic model fallback
     - 📥 CSV export of Q&A results
     - 🚀 **No API keys required** - runs completely local!
     
     **Example Questions that work:**
-    - "What is text embedding? Explain in 10 words."
-    - "What is text embedding? Explain in 5 words."
+    - "What is text embedding? Explain in 2 sentences."
     - "List 3 key benefits mentioned in the document."
-    - "Summarize the main conclusion in one sentence."
-    - "What are the risks? Answer briefly."
-    - "Who are the main stakeholders? List them."
+    - "Summarize the main conclusion briefly."
+    - "What are the risks? Answer in one paragraph."
+    - "Who are the main stakeholders?"
     
-    **Enhanced Features:**
-    - ✅ **Instruction Detection** - Automatically detects word limits and formatting requests
-    - ✅ **Smart Prompting** - Uses different prompts for different question types
-    - ✅ **Word Count Enforcement** - Enforces exact word limits when requested
-    - ✅ **Better Context Handling** - Prioritizes instructions over long context
+    **Deployment Features:**
+    - ✅ **No sentencepiece dependency issues** - automatic fallback to GPT-2
+    - ✅ **Works on Streamlit Cloud** - handles compilation failures gracefully
+    - ✅ **Fallback notification** - tells you which model is being used
+    - ✅ **Robust deployment** - doesn't fail due to build issues
     
-    **Requirements for deployment:**
+    **Optional for better performance:**
     ```
     sentencepiece
     ```
-    (Add this to your requirements.txt)
+    (FLAN-T5 works better for instructions, but GPT-2 fallback ensures deployment success)
     
     **How it works:**
-    1. ChromaDB finds relevant chunks using semantic search
-    2. Enhanced prompts ensure FLAN-T5 follows your specific instructions
-    3. Post-processing enforces word limits and formatting
-    4. You get precisely formatted responses that follow your requirements
+    1. Tries to load FLAN-T5 (best for instruction following)
+    2. Falls back to GPT-2 if sentencepiece fails to compile
+    3. ChromaDB finds relevant chunks using semantic search
+    4. Model generates answers based on document content
+    5. You get responses that follow your requirements (FLAN-T5) or good general answers (GPT-2)
     """)
     
     # Model loading test
-    if st.button("🔄 Test FLAN-T5 Loading"):
-        with st.spinner("Testing FLAN-T5 model loading..."):
-            model, tokenizer = load_flan_t5_model()
+    if st.button("🔄 Test Model Loading"):
+        with st.spinner("Testing model loading..."):
+            model, tokenizer, model_type = load_flan_t5_model()
             if model is not None:
-                st.success("✅ FLAN-T5 model loaded successfully!")
+                if model_type == "flan-t5":
+                    st.success("✅ FLAN-T5 model loaded successfully!")
+                else:
+                    st.success("✅ GPT-2 fallback model loaded successfully!")
+                    st.info("FLAN-T5 failed, but GPT-2 is working as backup.")
             else:
-                st.error("❌ Failed to load FLAN-T5 model - add 'sentencepiece' to requirements.txt")
+                st.error("❌ Failed to load any model")
